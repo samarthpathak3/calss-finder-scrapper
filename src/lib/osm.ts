@@ -11,6 +11,8 @@ import { USER_AGENT, googleMapsLink, mapLimit } from "./geo";
 import type { Place } from "./types";
 
 const PHOTON_URL = "https://photon.komoot.io/api/";
+const PHOTON_TIMEOUT_MS = 15_000;
+const PHOTON_RETRY_DELAYS_MS = [1_000, 3_000];
 const OVERPASS_URLS = ["https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter"];
 const OVERPASS_TIMEOUT_S = 45;
 
@@ -65,24 +67,45 @@ interface PhotonFeature {
   properties: Record<string, string | number | undefined>;
 }
 
-async function photon(keyword: string, lat: number, lng: number, bbox: number[]): Promise<PhotonFeature[]> {
+/** The public server regularly drops connections or answers 503, so transient failures are retried. */
+async function photon(keyword: string, lat: number, lng: number, bbox: number[], deadline: number): Promise<PhotonFeature[]> {
   const url = new URL(PHOTON_URL);
   url.search = new URLSearchParams({
     q: keyword, lat: String(lat), lon: String(lng), limit: "50", lang: "en",
     bbox: bbox.map((v) => v.toFixed(5)).join(","),
   }).toString();
-  const res = await fetch(url, { headers: { "User-Agent": USER_AGENT }, signal: AbortSignal.timeout(40_000) });
-  if (!res.ok) throw new Error(`Photon search failed (${res.status})`);
-  return (await res.json()).features ?? [];
+
+  let lastErr: unknown = new Error("out of time");
+  for (const delay of [0, ...PHOTON_RETRY_DELAYS_MS]) {
+    if (Date.now() + delay >= deadline) break;
+    if (delay) await new Promise((r) => setTimeout(r, delay));
+    try {
+      const res = await fetch(url, { headers: { "User-Agent": USER_AGENT }, signal: AbortSignal.timeout(PHOTON_TIMEOUT_MS) });
+      if (res.ok) return (await res.json()).features ?? [];
+      lastErr = new Error(`HTTP ${res.status}`);
+      if (res.status !== 429 && res.status < 500) break; // a retry would get the same answer
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr;
 }
 
+/** Keyword search for one category. A keyword that keeps failing is counted, not fatal. */
 export async function photonSearch(category: string, keywords: string[], osmTags: Record<string, string[]>,
-  lat: number, lng: number, radiusM: number): Promise<Place[]> {
+  lat: number, lng: number, radiusM: number, deadline: number): Promise<{ places: Place[]; failed: number }> {
   const dLat = radiusM / 111_320;
   const dLng = dLat / Math.max(0.1, Math.abs(Math.cos((lat * Math.PI) / 180)));
   const bbox = [lng - dLng, lat - dLat, lng + dLng, lat + dLat];
   const matches = nameMatcher(keywords);
-  const batches = await mapLimit(keywords, 4, (kw) => photon(kw, lat, lng, bbox));
+  let failed = 0;
+  const batches = await mapLimit(keywords, 2, (kw) =>
+    photon(kw, lat, lng, bbox, deadline).catch((e): PhotonFeature[] => {
+      failed++;
+      console.error(`Photon search for "${kw}" failed:`, e);
+      return [];
+    }),
+  );
 
   const places: Place[] = [];
   for (const f of batches.flat()) {
@@ -95,7 +118,7 @@ export async function photonSearch(category: string, keywords: string[], osmTags
     const address = joinAddress(p.housenumber, p.street, p.city || p.district, p.state, p.postcode);
     places.push(makePlace(category, p.name, address, {}, plat, plng, `${p.osm_type}/${p.osm_id}`));
   }
-  return places;
+  return { places, failed };
 }
 
 // ---------- Overpass tag search ----------

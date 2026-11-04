@@ -6,6 +6,9 @@ import { overpassSearch, photonSearch } from "./osm";
 import type { Place, SearchRequest } from "./types";
 
 const MAX_REVERSE_LOOKUPS = 40;
+// Stop starting new work in time to send what we have before the route's maxDuration (300s)
+const KEYWORD_BUDGET_MS = 180_000;
+const ADDRESS_BUDGET_MS = 270_000;
 
 /** Same place found by several queries/categories -> one entry, merged category names. */
 function mergeDuplicates(places: Place[]): Place[] {
@@ -29,6 +32,7 @@ function mergeDuplicates(places: Place[]): Place[] {
 }
 
 export async function findClasses(req: SearchRequest, progress: (msg: string) => void): Promise<{ label: string; places: Place[] }> {
+  const startedAt = Date.now();
   const { lat, lng, label } = await geocodeZip(req.zip, req.country);
   progress(`Located ${req.zip}: ${label}`);
   const radiusM = req.radiusMiles * 1609.34;
@@ -55,14 +59,24 @@ export async function findClasses(req: SearchRequest, progress: (msg: string) =>
       Object.fromEntries(jobs.filter(([, s]) => Object.keys(s.osmTags).length).map(([c, s]) => [c, s.osmTags])),
       lat, lng, radiusM,
     ).catch(() => null);
+    let total = 0;
+    let failed = 0;
     for (const [category, spec] of jobs) {
       progress(`Searching ${category} (OpenStreetMap)...`);
-      places.push(...(await photonSearch(category, spec.keywords, spec.osmTags, lat, lng, radiusM)));
+      const found = await photonSearch(category, spec.keywords, spec.osmTags, lat, lng, radiusM, startedAt + KEYWORD_BUDGET_MS);
+      places.push(...found.places);
+      total += spec.keywords.length;
+      failed += found.failed;
     }
     progress("Searching OpenStreetMap tags (dojos, dance schools, childcare)...");
     const tagged = await tagJob;
+    // Nothing to show because the servers failed is not the same as nothing nearby
+    if (failed && failed === total && !tagged?.length) {
+      throw new Error("The free OpenStreetMap search is overloaded right now. Please try again in a minute, or add a Google Maps API key in Settings.");
+    }
     if (tagged) places.push(...tagged);
     else progress("OpenStreetMap tag search is busy right now - using keyword results only.");
+    if (failed) progress(`${failed} of ${total} keyword searches failed because the free server is busy - this list may be incomplete. Search again for a fuller list.`);
   }
 
   for (const p of places) {
@@ -76,6 +90,7 @@ export async function findClasses(req: SearchRequest, progress: (msg: string) =>
     const missing = places.filter((p) => !p.address && p.latitude != null).slice(0, MAX_REVERSE_LOOKUPS);
     if (missing.length) progress(`Looking up ${missing.length} missing street addresses...`);
     for (const p of missing) {
+      if (Date.now() - startedAt >= ADDRESS_BUDGET_MS) break;
       p.address = await reverseGeocode(p.latitude!, p.longitude!);
       p.googleMapsUrl = googleMapsLink(p.name, p.address, p.latitude, p.longitude);
     }
